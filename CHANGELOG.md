@@ -11,7 +11,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - this CHANGELOG file.
 - CODEOWNERS file.
-
-### Changed
-
-- README title.
+- README file.
