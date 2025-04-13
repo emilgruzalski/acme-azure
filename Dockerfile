@@ -9,7 +9,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN go build -v -o /usr/local/bin/certbot-azure ./...
+RUN go build -v -o /usr/local/bin/acme-azure ./...
 
 # Create directory for ACME challenge files
 RUN mkdir -p /.well-known/acme-challenge
@@ -38,4 +38,4 @@ ENV SMTP_PASSWORD=""
 ENV SMTP_FROM=""
 ENV SMTP_TO=""
 
-CMD ["certbot-azure"]
+CMD ["acme-azure"]

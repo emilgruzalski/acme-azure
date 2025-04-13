@@ -1,4 +1,4 @@
-module github.com/emilgruzalski/certbot-azure
+module github.com/emilgruzalski/acme-azure
 
 go 1.24
 
