@@ -1,4 +1,4 @@
-# Certbot Azure
+# ACME Azure
 
 A Go application that automatically manages Let's Encrypt SSL certificates for multiple domains and stores them in Azure Key Vault. The application handles HTTP-01 challenge verification, converts certificates to PFX format, and automatically renews certificates when needed.
 
@@ -24,7 +24,7 @@ A Go application that automatically manages Let's Encrypt SSL certificates for m
 
 1. Create an Azure Service Principal:
 ```bash
-az ad sp create-for-rbac --name "certbot-azure" --role "Key Vault Certificates Officer"
+az ad sp create-for-rbac --name "acme-azure" --role "Key Vault Certificates Officer"
 ```
 
 2. Note down the following values:
@@ -66,7 +66,7 @@ az keyvault set-policy --name YOUR_KEYVAULT_NAME \
 
 1. Build the Docker image:
 ```bash
-docker build -t certbot-azure .
+docker build -t acme-azure .
 ```
 
 2. Run the container:
@@ -81,8 +81,8 @@ docker run -d \
   -e AZURE_KEYVAULT_NAME="your-keyvault-name" \
   -e AZURE_CERT_NAME="wildcard-cert" \
   -e CHECK_INTERVAL="24h" \
-  --name certbot-azure \
-  certbot-azure
+  --name acme-azure \
+  acme-azure
 ```
 
 ## Nginx Configuration
@@ -91,12 +91,12 @@ Add the following location block to your Nginx configuration to proxy ACME chall
 
 ```nginx
 location /.well-known/acme-challenge/ {
-    proxy_pass http://certbot-azure-container/.well-known/acme-challenge/;
+    proxy_pass http://acme-azure-container/.well-known/acme-challenge/;
     proxy_set_header Host $host;
 }
 ```
 
-Make sure to replace `certbot-azure-container` with the appropriate hostname or IP address where your container is running.
+Make sure to replace `acme-azure-container` with the appropriate hostname or IP address where your container is running.
 
 ## Azure Container Apps Deployment
 
@@ -104,17 +104,17 @@ Make sure to replace `certbot-azure-container` with the appropriate hostname or 
 ```bash
 az acr create --name myacr --resource-group mygroup --sku Basic
 az acr login --name myacr
-docker tag certbot-azure myacr.azurecr.io/certbot-azure:latest
-docker push myacr.azurecr.io/certbot-azure:latest
+docker tag acme-azure myacr.azurecr.io/acme-azure:latest
+docker push myacr.azurecr.io/acme-azure:latest
 ```
 
 2. Deploy to Azure Container Apps:
 ```bash
 az containerapp create \
-  --name certbot-azure \
+  --name acme-azure \
   --resource-group mygroup \
   --environment myenv \
-  --image myacr.azurecr.io/certbot-azure:latest \
+  --image myacr.azurecr.io/acme-azure:latest \
   --target-port 80 \
   --ingress external \
   --env-vars \
