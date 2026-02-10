@@ -10,16 +10,19 @@ import (
 	"encoding/pem"
 	"fmt"
 	"log"
+	"net/http"
 	"net/smtp"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azcertificates"
 	"github.com/go-acme/lego/v4/certificate"
-	"github.com/go-acme/lego/v4/challenge/http01"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
 	gopkcs12 "software.sslmate.com/src/go-pkcs12"
@@ -31,16 +34,46 @@ type User struct {
 	key          *rsa.PrivateKey
 }
 
-func (u *User) GetEmail() string {
-	return u.Email
+func (u *User) GetEmail() string                        { return u.Email }
+func (u *User) GetRegistration() *registration.Resource { return u.Registration }
+func (u *User) GetPrivateKey() crypto.PrivateKey        { return u.key }
+
+// challengeProvider implements lego's challenge.Provider interface
+// and http.Handler to serve ACME HTTP-01 tokens via the built-in HTTP server.
+type challengeProvider struct {
+	mu     sync.RWMutex
+	tokens map[string]string
 }
 
-func (u *User) GetRegistration() *registration.Resource {
-	return u.Registration
+func (p *challengeProvider) Present(domain, token, keyAuth string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tokens[token] = keyAuth
+	return nil
 }
 
-func (u *User) GetPrivateKey() crypto.PrivateKey {
-	return u.key
+func (p *challengeProvider) CleanUp(domain, token, keyAuth string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.tokens, token)
+	return nil
+}
+
+func (p *challengeProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimPrefix(r.URL.Path, "/.well-known/acme-challenge/")
+	if token == "" {
+		http.NotFound(w, r)
+		return
+	}
+	p.mu.RLock()
+	keyAuth, ok := p.tokens[token]
+	p.mu.RUnlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write([]byte(keyAuth))
 }
 
 type EmailConfig struct {
@@ -60,8 +93,8 @@ func getEmailConfig() EmailConfig {
 		SMTPPort:  getEnvWithDefault("SMTP_PORT", "587"),
 		Username:  os.Getenv("SMTP_USERNAME"),
 		Password:  os.Getenv("SMTP_PASSWORD"),
-		FromEmail: getEnvWithDefault("SMTP_FROM", os.Getenv("EMAIL")), // Default to the Let's Encrypt email
-		ToEmail:   getEnvWithDefault("SMTP_TO", os.Getenv("EMAIL")),   // Default to the Let's Encrypt email
+		FromEmail: getEnvWithDefault("SMTP_FROM", os.Getenv("EMAIL")),
+		ToEmail:   getEnvWithDefault("SMTP_TO", os.Getenv("EMAIL")),
 	}
 }
 
@@ -112,7 +145,6 @@ func main() {
 	renewBeforeDays := getEnvInt("RENEW_BEFORE_DAYS", 30)
 	domains := strings.Split(os.Getenv("DOMAINS"), ",")
 
-	// Validate domains
 	if len(domains) == 0 || (len(domains) == 1 && domains[0] == "") {
 		log.Fatal("No domains specified. Please set DOMAINS environment variable")
 	}
@@ -132,15 +164,79 @@ func main() {
 		log.Fatal("No certificate name specified. Please set AZURE_CERT_NAME environment variable")
 	}
 
-	pfxPassword := os.Getenv("PFX_PASSWORD") // Empty string if not set
+	pfxPassword := os.Getenv("PFX_PASSWORD")
+
+	// Graceful shutdown
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Azure Key Vault client (created once)
+	azCred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		log.Fatalf("Failed to create Azure credential: %v", err)
+	}
+
+	kvClient, err := azcertificates.NewClient(
+		fmt.Sprintf("https://%s.vault.azure.net/", keyVaultName),
+		azCred,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to create Key Vault client: %v", err)
+	}
+
+	// ACME account (registered once)
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		log.Fatalf("Failed to generate ACME account key: %v", err)
+	}
+
+	user := &User{Email: email, key: privateKey}
+
+	legoConfig := lego.NewConfig(user)
+	legoConfig.CADirURL = "https://acme-v02.api.letsencrypt.org/directory"
+
+	challenge := &challengeProvider{tokens: make(map[string]string)}
+
+	legoClient, err := lego.NewClient(legoConfig)
+	if err != nil {
+		log.Fatalf("Failed to create ACME client: %v", err)
+	}
+
+	if err := legoClient.Challenge.SetHTTP01Provider(challenge); err != nil {
+		log.Fatalf("Failed to set HTTP-01 provider: %v", err)
+	}
+
+	reg, err := legoClient.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
+	if err != nil {
+		log.Fatalf("Failed to register ACME account: %v", err)
+	}
+	user.Registration = reg
+	log.Printf("ACME account registered for %s", email)
+
+	// HTTP server for health checks and ACME challenges
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+	mux.Handle("/.well-known/acme-challenge/", challenge)
+
+	server := &http.Server{Addr: ":80", Handler: mux}
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+	log.Printf("HTTP server started on :80")
 
 	log.Printf("Starting certificate management for domains: %v", domains)
 	log.Printf("Check interval: %v, Renewal threshold: %d days", checkInterval, renewBeforeDays)
 
 	emailConfig := getEmailConfig()
 
-	for {
-		err := processCertificates(domains, email, keyVaultName, certName, pfxPassword, renewBeforeDays)
+	runCheck := func() {
+		err := processCertificates(ctx, legoClient, kvClient, domains, certName, pfxPassword, renewBeforeDays)
 		if err != nil {
 			log.Printf("Error processing certificates: %v", err)
 			if emailConfig.Enabled {
@@ -150,15 +246,30 @@ func main() {
 				}
 			}
 		}
+	}
 
-		log.Printf("Waiting %v before next check...", checkInterval)
-		time.Sleep(checkInterval)
+	// Run first check immediately
+	runCheck()
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Shutting down...")
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			server.Shutdown(shutdownCtx)
+			return
+		case <-ticker.C:
+			runCheck()
+		}
 	}
 }
 
-func processCertificates(domains []string, email, keyVaultName, certName, pfxPassword string, renewBeforeDays int) error {
-	// Check if certificate needs renewal
-	needsRenewal, err := checkIfRenewalNeeded(keyVaultName, certName, renewBeforeDays)
+func processCertificates(ctx context.Context, legoClient *lego.Client, kvClient *azcertificates.Client, domains []string, certName, pfxPassword string, renewBeforeDays int) error {
+	needsRenewal, err := checkIfRenewalNeeded(ctx, kvClient, certName, renewBeforeDays)
 	if err != nil {
 		log.Printf("Error checking certificate renewal: %v", err)
 	}
@@ -168,56 +279,20 @@ func processCertificates(domains []string, email, keyVaultName, certName, pfxPas
 		return nil
 	}
 
-	// Create a user
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return fmt.Errorf("error generating private key: %v", err)
-	}
-
-	user := &User{
-		Email: email,
-		key:   privateKey,
-	}
-
-	config := lego.NewConfig(user)
-	config.CADirURL = "https://acme-v02.api.letsencrypt.org/directory"
-
-	client, err := lego.NewClient(config)
-	if err != nil {
-		return fmt.Errorf("error creating client: %v", err)
-	}
-
-	// Solve HTTP-01 challenge
-	err = client.Challenge.SetHTTP01Provider(http01.NewProviderServer("", "80"))
-	if err != nil {
-		return fmt.Errorf("error setting up HTTP-01 provider: %v", err)
-	}
-
-	// Register user
-	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
-	if err != nil {
-		return fmt.Errorf("error registering user: %v", err)
-	}
-	user.Registration = reg
-
-	// Request certificate
-	request := certificate.ObtainRequest{
+	certificates, err := legoClient.Certificate.Obtain(certificate.ObtainRequest{
 		Domains: domains,
 		Bundle:  true,
-	}
-	certificates, err := client.Certificate.Obtain(request)
+	})
 	if err != nil {
 		return fmt.Errorf("error obtaining certificate: %v", err)
 	}
 
-	// Convert to PFX
 	pfxData, err := convertToPFX(certificates.Certificate, certificates.PrivateKey, pfxPassword)
 	if err != nil {
 		return fmt.Errorf("error converting to PFX: %v", err)
 	}
 
-	// Upload to Azure Key Vault
-	err = uploadToKeyVault(context.Background(), keyVaultName, certName, pfxData, pfxPassword)
+	err = uploadToKeyVault(ctx, kvClient, certName, pfxData, pfxPassword)
 	if err != nil {
 		return fmt.Errorf("error uploading to Key Vault: %v", err)
 	}
@@ -226,22 +301,7 @@ func processCertificates(domains []string, email, keyVaultName, certName, pfxPas
 	return nil
 }
 
-func checkIfRenewalNeeded(keyVaultName, certName string, renewBeforeDays int) (bool, error) {
-	ctx := context.Background()
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return true, fmt.Errorf("failed to create credential: %v", err)
-	}
-
-	client, err := azcertificates.NewClient(
-		fmt.Sprintf("https://%s.vault.azure.net/", keyVaultName),
-		cred,
-		nil,
-	)
-	if err != nil {
-		return true, fmt.Errorf("failed to create client: %v", err)
-	}
-
+func checkIfRenewalNeeded(ctx context.Context, client *azcertificates.Client, certName string, renewBeforeDays int) (bool, error) {
 	cert, err := client.GetCertificate(ctx, certName, "", nil)
 	if err != nil {
 		return true, fmt.Errorf("failed to get certificate: %v", err)
@@ -265,7 +325,6 @@ func checkIfRenewalNeeded(keyVaultName, certName string, renewBeforeDays int) (b
 }
 
 func convertToPFX(certPEM, keyPEM []byte, password string) ([]byte, error) {
-	// Decode private key
 	keyBlock, _ := pem.Decode(keyPEM)
 	if keyBlock == nil {
 		return nil, fmt.Errorf("failed to decode private key PEM")
@@ -273,7 +332,6 @@ func convertToPFX(certPEM, keyPEM []byte, password string) ([]byte, error) {
 
 	privateKey, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
 	if err != nil {
-		// Try PKCS8 format as fallback
 		key, err2 := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
 		if err2 != nil {
 			return nil, fmt.Errorf("failed to parse private key: PKCS1: %v, PKCS8: %v", err, err2)
@@ -285,7 +343,6 @@ func convertToPFX(certPEM, keyPEM []byte, password string) ([]byte, error) {
 		}
 	}
 
-	// Decode certificates (leaf + intermediates)
 	var certs []*x509.Certificate
 	rest := certPEM
 	for {
@@ -304,7 +361,6 @@ func convertToPFX(certPEM, keyPEM []byte, password string) ([]byte, error) {
 		return nil, fmt.Errorf("no certificates found in PEM data")
 	}
 
-	// First cert is the leaf, rest are CA chain
 	leaf := certs[0]
 	var caCerts []*x509.Certificate
 	if len(certs) > 1 {
@@ -319,27 +375,12 @@ func convertToPFX(certPEM, keyPEM []byte, password string) ([]byte, error) {
 	return pfxData, nil
 }
 
-func uploadToKeyVault(ctx context.Context, vaultName, certName string, pfxData []byte, password string) error {
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return fmt.Errorf("failed to create credential: %v", err)
-	}
-
-	client, err := azcertificates.NewClient(
-		fmt.Sprintf("https://%s.vault.azure.net/", vaultName),
-		cred,
-		nil,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create client: %v", err)
-	}
-
+func uploadToKeyVault(ctx context.Context, client *azcertificates.Client, certName string, pfxData []byte, password string) error {
 	certString := base64.StdEncoding.EncodeToString(pfxData)
-	_, err = client.ImportCertificate(ctx, certName, azcertificates.ImportCertificateParameters{
+	_, err := client.ImportCertificate(ctx, certName, azcertificates.ImportCertificateParameters{
 		Base64EncodedCertificate: &certString,
 		Password:                 &password,
 	}, nil)
-
 	return err
 }
 
