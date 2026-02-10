@@ -8,6 +8,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.9.0
 	github.com/Azure/azure-sdk-for-go/sdk/keyvault/azcertificates v0.9.0
 	github.com/go-acme/lego/v4 v4.22.2
+	software.sslmate.com/src/go-pkcs12 v0.7.0
 )
 
 require (
