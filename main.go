@@ -5,12 +5,13 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net/smtp"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/go-acme/lego/v4/challenge/http01"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
+	gopkcs12 "software.sslmate.com/src/go-pkcs12"
 )
 
 type User struct {
@@ -263,57 +265,58 @@ func checkIfRenewalNeeded(keyVaultName, certName string, renewBeforeDays int) (b
 }
 
 func convertToPFX(certPEM, keyPEM []byte, password string) ([]byte, error) {
-	// Create temporary files
-	certFile, err := os.CreateTemp("", "cert-*.pem")
+	// Decode private key
+	keyBlock, _ := pem.Decode(keyPEM)
+	if keyBlock == nil {
+		return nil, fmt.Errorf("failed to decode private key PEM")
+	}
+
+	privateKey, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp cert file: %v", err)
+		// Try PKCS8 format as fallback
+		key, err2 := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+		if err2 != nil {
+			return nil, fmt.Errorf("failed to parse private key: PKCS1: %v, PKCS8: %v", err, err2)
+		}
+		var ok bool
+		privateKey, ok = key.(*rsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("parsed key is not RSA")
+		}
 	}
-	certFileName := certFile.Name()
-	certFile.Close()
-	defer os.Remove(certFileName)
 
-	keyFile, err := os.CreateTemp("", "key-*.pem")
+	// Decode certificates (leaf + intermediates)
+	var certs []*x509.Certificate
+	rest := certPEM
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse certificate: %v", err)
+		}
+		certs = append(certs, cert)
+	}
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("no certificates found in PEM data")
+	}
+
+	// First cert is the leaf, rest are CA chain
+	leaf := certs[0]
+	var caCerts []*x509.Certificate
+	if len(certs) > 1 {
+		caCerts = certs[1:]
+	}
+
+	pfxData, err := gopkcs12.Encode(rand.Reader, privateKey, leaf, caCerts, password)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp key file: %v", err)
-	}
-	keyFileName := keyFile.Name()
-	keyFile.Close()
-	defer os.Remove(keyFileName)
-
-	pfxFile, err := os.CreateTemp("", "cert-*.pfx")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp pfx file: %v", err)
-	}
-	pfxFileName := pfxFile.Name()
-	pfxFile.Close()
-	defer os.Remove(pfxFileName)
-
-	// Write certificate and key to temporary files
-	if err := os.WriteFile(certFileName, certPEM, 0600); err != nil {
-		return nil, fmt.Errorf("failed to write cert file: %v", err)
-	}
-	if err := os.WriteFile(keyFileName, keyPEM, 0600); err != nil {
-		return nil, fmt.Errorf("failed to write key file: %v", err)
+		return nil, fmt.Errorf("failed to encode PFX: %v", err)
 	}
 
-	// Convert using OpenSSL with password if provided
-	args := []string{"pkcs12", "-export",
-		"-out", pfxFileName,
-		"-inkey", keyFileName,
-		"-in", certFileName}
-
-	if password != "" {
-		args = append(args, "-passout", "pass:"+password)
-	} else {
-		args = append(args, "-passout", "pass:")
-	}
-
-	cmd := exec.Command("openssl", args...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("openssl command failed: %v, output: %s", err, output)
-	}
-
-	return os.ReadFile(pfxFileName)
+	return pfxData, nil
 }
 
 func uploadToKeyVault(ctx context.Context, vaultName, certName string, pfxData []byte, password string) error {
