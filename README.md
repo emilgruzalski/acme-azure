@@ -2,15 +2,58 @@
 
 A Go application that automatically manages Let's Encrypt SSL certificates for multiple domains and stores them in Azure Key Vault. The application handles HTTP-01 challenge verification, converts certificates to PFX format, and automatically renews certificates when needed.
 
+## How It Works
+
+The application runs as a long-lived daemon alongside your UI applications in an Azure Container Apps Environment. An ingress rule routes `/.well-known/acme-challenge/*` traffic to this container while the rest goes to your UI apps.
+
+```
+                     Azure Container Apps Environment
+                    ┌──────────────────────────────────────────┐
+                    │                                          │
+                    │  ┌────────────┐    ┌────────────────┐    │
+internet ─── LB ───┼─>│ UI App     │    │ UI App         │    │
+  │                 │  │ dev.app.com│    │ prd.app.com    │    │
+  │                 │  └────────────┘    └────────────────┘    │
+  │                 │                                          │
+  │ /.well-known/   │  ┌─────────────────┐                    │
+  │ acme-challenge/ ┼─>│ acme-azure      │                    │
+  │                 │  │ (this container) │                    │
+  │                 │  └────────┬────────┘                    │
+  │                 │           │                              │
+  │                 └───────────┼──────────────────────────────┘
+  │                             │
+  │                             ▼
+  │                 ┌─────────────────────┐
+  │                 │ Azure Key Vault     │
+  │                 │ ┌─────────────────┐ │
+  │                 │ │ wildcard-cert   │ │
+  │                 │ └─────────────────┘ │
+  │                 └─────────────────────┘
+  │                             ▲
+  │                             │ Container Apps binds
+  └─────────────────────────────┘ cert to custom domains
+```
+
+On each cycle (default: every 24 hours) the application:
+
+1. **Checks the certificate** in Azure Key Vault — reads expiration date and compares it against the renewal threshold (default: 30 days before expiry). If valid, skips to sleep.
+2. **Requests a new certificate** from Let's Encrypt via ACME protocol — generates an RSA key, registers with Let's Encrypt, and starts an HTTP server on port 80.
+3. **Completes the HTTP-01 challenge** — Let's Encrypt sends a request to `http://<domain>/.well-known/acme-challenge/<token>`, the ingress rule routes it to this container, which responds with the verification token.
+4. **Converts PEM to PFX** — Let's Encrypt returns a PEM certificate; Azure Key Vault requires PFX/PKCS12 format. The conversion is done in-memory using a native Go library (no OpenSSL dependency).
+5. **Uploads to Azure Key Vault** — the PFX is base64-encoded and imported via Azure SDK. Container Apps picks up the new certificate for custom domain bindings.
+6. **Sleeps** until the next check interval.
+
+If any step fails and email notifications are enabled, the application sends an error report via SMTP and retries on the next cycle.
+
 ## Features
 
 - Automatic SSL certificate generation using Let's Encrypt
 - Supports multiple domains in a single certificate
 - HTTP-01 challenge verification
-- Automatic conversion to PFX format
+- In-memory PFX conversion (no OpenSSL required)
 - Azure Key Vault integration
 - Continuous certificate monitoring and renewal
-- Docker support
+- Minimal Docker image (~20 MB, distroless, non-root)
 
 ## Prerequisites
 
@@ -206,7 +249,3 @@ Each notification includes:
 - Use network security groups to restrict access to the container
 - Regularly rotate the Service Principal credentials
 - Monitor Key Vault audit logs for certificate operations
-
-## License
-
-MIT License
