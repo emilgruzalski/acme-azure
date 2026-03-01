@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: emilgruzalski/gh-reusable-workflows/.github/workflows/ci-go.yml@v1
+    with:
+      image-name: 'acme-azure'
+      go-version-file: 'go.mod'
+      working-directory: '.'
+      dockerfile: './Dockerfile'
+      context: '.'
+      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: write
+      packages: write
+      security-events: write
+      id-token: write
