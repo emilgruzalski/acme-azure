@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -81,7 +80,7 @@ func convertToPFX(certPEM, keyPEM []byte, password string) ([]byte, error) {
 		caCerts = certs[1:]
 	}
 
-	pfxData, err := gopkcs12.Encode(rand.Reader, privateKey, leaf, caCerts, password)
+	pfxData, err := gopkcs12.Legacy.Encode(privateKey, leaf, caCerts, password)
 	if err != nil {
 		return nil, fmt.Errorf("encoding PFX: %w", err)
 	}
