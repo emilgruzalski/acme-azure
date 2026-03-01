@@ -55,5 +55,5 @@ func (p *challengeProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Write([]byte(keyAuth))
+	_, _ = w.Write([]byte(keyAuth))
 }

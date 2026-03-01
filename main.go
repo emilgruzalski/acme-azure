@@ -126,7 +126,7 @@ func run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	mux.Handle("/.well-known/acme-challenge/", challenge)
 
@@ -168,8 +168,7 @@ func run() error {
 			log.Println("Shutting down...")
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer shutdownCancel()
-			server.Shutdown(shutdownCtx)
-			return nil
+			return server.Shutdown(shutdownCtx)
 		case <-ticker.C:
 			runCheck()
 		}
